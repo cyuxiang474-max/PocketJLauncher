@@ -104,12 +104,17 @@ jobs:
           find "${APP}" -maxdepth 3 \( -name '*.appex' -o -name '*.framework' \) | sort
           echo "---------------- helper Info.plist -------------------"
           plutil -p "${APP}/Extensions/PocketJJITHelper.appex/Info.plist"
-          echo "---------------- host entitlements --------------------"
-          codesign --display --entitlements - --xml "${APP}" | plutil -p -
-          echo "---------------- appexpt sealed? ---------------------"
-          grep -c 'appexpt' "${APP}/_CodeSignature/CodeResources" || true
-          echo "---------------- helper sealed? ----------------------"
-          grep -c 'PocketJJITHelper' "${APP}/_CodeSignature/CodeResources" || true
+          echo "---------------- host executable entitlements --------------------"
+          # codesign writes the entitlements plist to stderr for some signing
+          # modes, so read them into a file first and never fail the step on it.
+          codesign -d --entitlements :- "${APP}/PocketJLauncher" 2>/dev/null > pj-ent.plist || true
+          if [ -s pj-ent.plist ]; then plutil -p pj-ent.plist; else
+            echo "(no entitlements blob readable via codesign)"
+          fi
+          echo "---------------- sealed resources --------------------"
+          grep -o 'PocketJLauncher\.appexpt' "${APP}/_CodeSignature/CodeResources" | head -1 || echo "WARNING: appexpt NOT in CodeResources"
+          grep -o 'PocketJJITHelper\.appex' "${APP}/_CodeSignature/CodeResources" | head -1 || echo "WARNING: helper NOT in CodeResources"
+          grep -o 'PocketJJITCoordinator\.framework' "${APP}/_CodeSignature/CodeResources" | head -1 || echo "WARNING: coordinator NOT in CodeResources"
           echo "================ architecture ========================="
           file "${APP}/PocketJLauncher"
           ls "${APP}/java_runtimes" || true
