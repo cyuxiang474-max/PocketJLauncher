@@ -1,0 +1,108 @@
+name: Build (hosted runner)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fix/**"
+
+jobs:
+  build:
+    name: Build PocketJ Launcher IPA
+    # ExtensionKit's AppExtensionPoint requires the iOS 26 SDK, so an Intel
+    # image with Xcode 26 is used: the Makefile needs a mac/x64 JDK 8, which
+    # runs natively on x86_64 instead of through Rosetta.
+    runs-on: macos-26-intel
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+          ls /Applications | grep -i xcode || true
+
+      - name: Install Homebrew build dependencies
+        run: |
+          set -euxo pipefail
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          # ldid pulls in a cask whose installer needs this helper to exist;
+          # install it first and tolerate failure so the ldid step decides.
+          brew install --cask diskcatalogmaker || true
+          brew install make
+          brew install ldid || brew install ldid --formula || true
+          brew install xcodegen
+          command -v gmake
+          command -v xcodegen
+          command -v ldid
+          command -v cmake
+
+      - name: Generate Xcode project
+        run: |
+          set -euxo pipefail
+          xcodegen --version
+          xcodegen generate --spec project.yml
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          xcodebuild \
+            -project PocketJLauncher.xcodeproj \
+            -scheme "PocketJ Launcher" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+      - name: Verify and package IPA
+        run: |
+          set -euxo pipefail
+          APP="build/Build/Products/Release-iphoneos/PocketJLauncher.app"
+          test -d "${APP}"
+          test -x "${APP}/PocketJLauncher"
+
+          echo "================ ExtensionKit layout ================"
+          find "${APP}/Extensions" -maxdepth 1 | sort
+          echo "---------------- .appexpt contents -------------------"
+          find "${APP}/Extensions" -maxdepth 1 -name '*.appexpt' -exec plutil -p {} \;
+          echo "---------------- embedded bundles --------------------"
+          find "${APP}" -maxdepth 3 \( -name '*.appex' -o -name '*.framework' \) | sort
+          echo "---------------- helper Info.plist -------------------"
+          plutil -p "${APP}/Extensions/PocketJJITHelper.appex/Info.plist"
+          echo "---------------- host entitlements --------------------"
+          codesign --display --entitlements - --xml "${APP}" | plutil -p -
+          echo "---------------- appexpt sealed? ---------------------"
+          grep -c 'appexpt' "${APP}/_CodeSignature/CodeResources" || true
+          echo "---------------- helper sealed? ----------------------"
+          grep -c 'PocketJJITHelper' "${APP}/_CodeSignature/CodeResources" || true
+          echo "================ architecture ========================="
+          file "${APP}/PocketJLauncher"
+          ls "${APP}/java_runtimes" || true
+          du -sh "${APP}"
+
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "${APP}" ipa/Payload/
+          ( cd ipa && zip -qr ../PocketJLauncher-ios27.ipa Payload )
+          ls -la PocketJLauncher-ios27.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketJLauncher-ios27-ipa
+          path: PocketJLauncher-ios27.ipa
+          retention-days: 30

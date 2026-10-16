@@ -66,8 +66,17 @@ rm -f "${BOOT_JDK_BRIDGE}"
 ln -s "${BOOT_JDK}" "${BOOT_JDK_BRIDGE}"
 BOOT_JDK="${BOOT_JDK_BRIDGE}"
 
+# XcodeGen writes this as a post-build phase, so it must run under a login-like
+# shell. PATH above already carries both Homebrew prefixes; resolve GNU make
+# instead of assuming Apple Silicon's /opt/homebrew/bin.
+GMAKE_BIN="$(command -v gmake || true)"
+if [[ -z "${GMAKE_BIN}" ]]; then
+  echo "error: GNU make (gmake) was not found on PATH"
+  exit 1
+fi
+
 cd "${WORK_ROOT}"
-/opt/homebrew/bin/gmake payload \
+"${GMAKE_BIN}" payload \
   JOBS=8 \
   PLATFORM=2 \
   RELEASE=$([[ "${CONFIGURATION}" == "Release" ]] && echo 1 || echo 0) \
@@ -122,10 +131,20 @@ if [[ "${EXECUTABLE_NAME}" != "PocketJLauncher" ]]; then
 fi
 
 SIGN_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+ENTITLEMENTS="${SOURCE_ROOT}/entitlements.sideload.xml"
 find "${PRODUCT_APP}" -type f | while IFS= read -r ITEM; do
   if file "${ITEM}" | /usr/bin/grep -q "Mach-O"; then
-    /usr/bin/codesign --force --sign "${SIGN_IDENTITY}" \
-      --timestamp=none "${ITEM}"
+    # The Makefile already ran ldid with the sideload entitlements on the
+    # payload executable. Re-signing here without re-applying them would
+    # replace that signature with an empty entitlement set, which hides the
+    # app from StikDebug (it keys off get-task-allow).
+    if [[ "$(/usr/bin/basename "${ITEM}")" == "${EXECUTABLE_NAME}" ]]; then
+      /usr/bin/codesign --force --sign "${SIGN_IDENTITY}" \
+        --timestamp=none --entitlements "${ENTITLEMENTS}" "${ITEM}"
+    else
+      /usr/bin/codesign --force --sign "${SIGN_IDENTITY}" \
+        --timestamp=none "${ITEM}"
+    fi
   fi
 done
 
@@ -138,5 +157,22 @@ if [[ -d "${PRODUCT_APP}/Extensions/PocketJJITHelper.appex/Frameworks/StikJIT.fr
 fi
 /usr/bin/codesign --force --sign "${SIGN_IDENTITY}" --timestamp=none \
   "${PRODUCT_APP}/Extensions/PocketJJITHelper.appex"
+
+# Every file above was merged into the wrapper after Xcode had already sealed
+# it, so the wrapper's CodeResources no longer describes the shipped bundle.
+# ExtensionFoundation validates that seal before it publishes a host extension
+# point, and a stale seal makes AppExtensionPoint.Monitor fail with
+# "Failed to add observer". Re-seal the host app itself last.
+/usr/bin/codesign --force --sign "${SIGN_IDENTITY}" --timestamp=none \
+  "${PRODUCT_APP}"
+
+echo "--- host extension points ---"
+/usr/bin/find "${PRODUCT_APP}/Extensions" -maxdepth 1 -name "*.appexpt" -print \
+  -exec /usr/bin/plutil -p {} \;
+echo "--- embedded bundles ---"
+/usr/bin/find "${PRODUCT_APP}" -maxdepth 2 \( -name "*.appex" -o -name "*.framework" \) -print
+echo "--- host entitlements ---"
+/usr/bin/codesign --display --entitlements - --xml "${PRODUCT_APP}" \
+  2>/dev/null | /usr/bin/plutil -p - 2>/dev/null || true
 
 echo "PocketJ Launcher engine embedded into ${PRODUCT_APP}"
