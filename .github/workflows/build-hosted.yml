@@ -63,6 +63,16 @@ jobs:
           xcodegen --version
           xcodegen generate --spec project.yml
 
+      - name: Provide local build secrets header
+        run: |
+          set -euxo pipefail
+          # ModManagerViewController.m and PocketJResourceLibraryViewController.m
+          # import CurseForgeSecrets.local.h, which is gitignored because it
+          # carries a private API key. The committed sample compiles with an
+          # empty key, so CurseForge browsing stays disabled.
+          cp Natives/CurseForgeSecrets.sample.h Natives/CurseForgeSecrets.local.h
+          cat Natives/CurseForgeSecrets.local.h
+
       - name: Build
         run: |
           set -euxo pipefail
