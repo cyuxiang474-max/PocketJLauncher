@@ -32,9 +32,17 @@ public final class PocketJJITCoordinator: NSObject {
 
         Task { @MainActor in
             do {
+                NSLog("[PocketJJITCoordinator] bundleID=\(Bundle.main.bundleIdentifier ?? "(null)") bundlePath=\(Bundle.main.bundlePath)")
+                NSLog("[PocketJJITCoordinator] creating Monitor for .pocketJJITHelper")
                 let monitor = try await AppExtensionPoint.Monitor(
                     appExtensionPoint: .pocketJJITHelper)
+                NSLog("[PocketJJITCoordinator] Monitor ok, identities=\(monitor.identities.count)")
+                for identity in monitor.identities {
+                    NSLog("[PocketJJITCoordinator] identity=\(String(describing: identity))")
+                }
                 guard let identity = monitor.identities.first else {
+                    NSLog("[PocketJJITCoordinator] no identity: the system did not "
+                          + "register this host's app extension")
                     throw NSError(domain: "PocketJJIT", code: 1,
                                   userInfo: [NSLocalizedDescriptionKey:
                                     "PocketJ JIT Helper was not found in this installation."])
@@ -64,7 +72,20 @@ public final class PocketJJITCoordinator: NSObject {
                 }
             } catch {
                 activeSession = nil
-                completion(false, error.localizedDescription)
+                // "Failed to add observer" carries no context on its own. Log
+                // the full error so the launch log names the failing stage.
+                var cursor: Error? = error
+                var depth = 0
+                while let current = cursor, depth < 8 {
+                    let nsError = current as NSError
+                    NSLog("[PocketJJITCoordinator] error[\(depth)] domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)")
+                    cursor = nsError.userInfo[NSUnderlyingErrorKey] as? Error
+                    depth += 1
+                }
+                NSLog("[PocketJJITCoordinator] failing stage identified above")
+                let nsError = error as NSError
+                completion(false,
+                           "\(error.localizedDescription) [\(nsError.domain):\(nsError.code)]")
             }
         }
     }

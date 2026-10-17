@@ -28,6 +28,89 @@
                     completion:(void (^)(BOOL success, NSString *message))completion;
 @end
 
+// AppExtensionPoint.Monitor throws a bare "Failed to add observer" that does
+// not say which of its many preconditions failed. Dump everything the host can
+// observe locally so a single launch log identifies the broken link.
+static void PJDumpJITEnvironment(NSString *stage) {
+    NSBundle *bundle = NSBundle.mainBundle;
+    NSString *bundlePath = bundle.bundlePath;
+    NSString *bundleID = bundle.bundleIdentifier ?: @"(null)";
+    NSString *home = NSHomeDirectory();
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    NSLog(@"[JITDiag] ======== %@ ========", stage);
+    NSLog(@"[JITDiag] bundleID      = %@", bundleID);
+    NSLog(@"[JITDiag] bundlePath    = %@", bundlePath);
+    NSLog(@"[JITDiag] executable    = %@", bundle.executablePath ?: @"(null)");
+    NSLog(@"[JITDiag] NSHomeDirectory = %@", home);
+    NSLog(@"[JITDiag] HOME env      = %@", getenv("HOME") ?: @"(unset)");
+    NSLog(@"[JITDiag] pid           = %d", getpid());
+
+    // A container app such as LiveContainer relocates the guest app under
+    // <host container>/Documents/Data/Application/<uuid>/. ExtensionFoundation
+    // resolves the host identity from the system app database, which never
+    // contains such a nested bundle, so the extension point cannot be found.
+    NSRange own = [home rangeOfString:@"/Containers/Data/Application/"];
+    NSString *containerTail = @"";
+    if (own.location != NSNotFound) {
+        containerTail = [home substringFromIndex:NSMaxRange(own)];
+    }
+    NSUInteger nestedApplications = [home componentsSeparatedByString:@"/Documents/Data/Application/"].count - 1;
+    BOOL insideContainerHost = nestedApplications > 0;
+    NSLog(@"[JITDiag] nested 'Documents/Data/Application' components = %lu  (containerHost=%@)",
+          (unsigned long)nestedApplications, insideContainerHost ? @"YES" : @"no");
+    if (insideContainerHost) {
+        NSLog(@"[JITDiag] !!! running inside another app's container (container tail=%@)", containerTail);
+    }
+
+    NSString *expectID = @"com.Erico.PocketJLauncher";
+    if (![bundleID isEqualToString:expectID]) {
+        NSLog(@"[JITDiag] !!! bundle identifier is '%@', expected '%@' — the host was re-signed or re-branded",
+              bundleID, expectID);
+    }
+
+    NSString *ext = [bundlePath stringByAppendingPathComponent:@"Extensions"];
+    NSString *appexpt = [ext stringByAppendingPathComponent:@"PocketJLauncher.appexpt"];
+    NSString *appex = [ext stringByAppendingPathComponent:@"PocketJJITHelper.appex"];
+    NSString *framework = [bundle.privateFrameworksPath
+        stringByAppendingPathComponent:@"PocketJJITCoordinator.framework/PocketJJITCoordinator"];
+    for (NSArray *pair in @[@[@"Extensions dir", ext], @[@".appexpt", appexpt],
+                             @[@"PocketJJITHelper.appex", appex],
+                             @[@"PocketJJITCoordinator", framework]]) {
+        NSString *label = pair[0], *path = pair[1];
+        BOOL exists = [fm fileExistsAtPath:path];
+        NSLog(@"[JITDiag] %@ -> %@ %@", label, exists ? @"present" : @"MISSING", path);
+    }
+    if ([fm fileExistsAtPath:appexpt]) {
+        NSData *appexptData = [NSData dataWithContentsOfFile:appexpt];
+        NSLog(@"[JITDiag] .appexpt bytes = %lu", (unsigned long)appexptData.length);
+        NSLog(@"[JITDiag] .appexpt raw = %@",
+              [[NSString alloc] initWithData:appexptData encoding:NSUTF8StringEncoding]
+                  ?: @"(not utf-8)");
+    }
+
+    // Confirm the resource seal actually covers the extension point: without
+    // it ExtensionFoundation refuses to publish the host extension point.
+    NSString *resources = [bundlePath stringByAppendingPathComponent:@"_CodeSignature/CodeResources"];
+    if ([fm fileExistsAtPath:resources]) {
+        NSData *seal = [NSData dataWithContentsOfFile:resources];
+        NSString *sealText = [[NSString alloc] initWithData:seal encoding:NSISOLatin1StringEncoding] ?: @"";
+        NSLog(@"[JITDiag] CodeResources bytes=%lu appexptRefs=%ld helperRefs=%ld coordinatorRefs=%ld",
+              (unsigned long)seal.length,
+              (long)[sealText occurrencesOfString:@"appexpt"],
+              (long)[sealText occurrencesOfString:@"PocketJJITHelper.appex"],
+              (long)[sealText occurrencesOfString:@"PocketJJITCoordinator.framework"]);
+    } else {
+        NSLog(@"[JITDiag] CodeResources MISSING (bundle is not sealed)");
+    }
+
+    NSLog(@"[JITDiag] entitlement extended-virtual-addressing = %@", getEntitlementValue(@"com.apple.developer.kernel.extended-virtual-addressing") ? @"YES" : @"NO");
+    NSLog(@"[JITDiag] entitlement increased-memory-limit       = %@", getEntitlementValue(@"com.apple.developer.kernel.increased-memory-limit") ? @"YES" : @"NO");
+    NSLog(@"[JITDiag] entitlement get-task-allow                = %@", getEntitlementValue(@"get-task-allow") ? @"YES" : @"NO");
+    NSLog(@"[JITDiag] entitlement jb.pmap_cs.custom_trust       = %@", getEntitlementValue(@"jb.pmap_cs.custom_trust") ? @"YES" : @"NO");
+    NSLog(@"[JITDiag] ==============================");
+}
+
 @implementation StikDebugViewController
 
 + (PocketJJITSetupState)setupState {
@@ -52,9 +135,17 @@
         }
         NSString *framework = [NSBundle.mainBundle.privateFrameworksPath
             stringByAppendingPathComponent:@"PocketJJITCoordinator.framework/PocketJJITCoordinator"];
+        PJDumpJITEnvironment(@"before coordinator launch");
         void *handle = dlopen(framework.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            const char *why = dlerror();
+            NSLog(@"[JITDiag] dlopen FAILED: %s", why ?: "(no dlerror text)");
+        } else {
+            NSLog(@"[JITDiag] dlopen ok: %p", handle);
+        }
         Class<PocketJJITCoordinatorAPI> coordinator =
             (Class<PocketJJITCoordinatorAPI>)NSClassFromString(@"PocketJJITCoordinator");
+        NSLog(@"[JITDiag] NSClassFromString(PocketJJITCoordinator) = %@", coordinator ?: @"(null)");
         if (handle && coordinator) {
             __block BOOL delivered = NO;
             __block dispatch_source_t stateTimer = dispatch_source_create(
