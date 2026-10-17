@@ -21,6 +21,12 @@
 @property(nonatomic, strong) UIButton *enableButton;
 - (NSString *)userFacingErrorMessage:(NSString *)message;
 - (void)refreshLocalDevVPNStatus;
++ (void)requestStikDebugHandoffWithCompletion:
+    (void (^)(BOOL success, NSString *message))completion;
++ (void)waitForStikDebugAttachWithCompletion:
+    (void (^)(BOOL success, NSString *message))completion;
++ (BOOL)enableJITWithBundledHelper:
+    (void (^)(BOOL success, NSString *message))completion;
 @end
 
 @protocol PocketJJITCoordinatorAPI <NSObject>
@@ -118,13 +124,24 @@ static void PJDumpJITEnvironment(NSString *stage) {
     NSLog(@"[JITDiag] ==============================");
 }
 
+// CS_DEBUGGED survives a detach, so it is only ever a hint. isJITEnabled(YES)
+// adds the iOS 26+ TXM mapping check and is what readiness is decided on.
+static BOOL PJIsDebuggerAttached(void) {
+    int flags = 0;
+    csops(getpid(), 0, &flags, sizeof(flags));
+    return (flags & CS_DEBUGGED) != 0;
+}
+
 @implementation StikDebugViewController
 
 + (PocketJJITSetupState)setupState {
     if (@available(iOS 17.4, *)) {
         [StikDebugEngine.sharedEngine synchronizePairingFileFromDocuments:nil];
         if (isJITEnabled(YES)) return PocketJJITSetupStateEnabled;
-        return StikDebugEngine.sharedEngine.hasPairingFile
+        // The StikDebug handoff supplies its own pairing, so an imported file
+        // is only needed by the bundled ExtensionKit fallback. The one hard
+        // prerequisite is get-task-allow: debugserver refuses any other target.
+        return getEntitlementValue(@"get-task-allow")
             ? PocketJJITSetupStateReady
             : PocketJJITSetupStateWaitingConfiguration;
     }
@@ -133,12 +150,117 @@ static void PJDumpJITEnvironment(NSString *stage) {
 
 + (void)enableEmbeddedJITWithCompletion:
         (void (^)(BOOL success, NSString *message))completion {
+    // Hand the request to the StikDebug app installed alongside us. This is the
+    // route that works on every iOS version and it needs no pairing file inside
+    // PocketJ Launcher, because StikDebug supplies its own.
+    [self requestStikDebugHandoffWithCompletion:completion];
+}
+
++ (void)requestStikDebugHandoffWithCompletion:
+        (void (^)(BOOL success, NSString *message))completion {
+    if (isJITEnabled(YES)) {
+        if (completion) completion(YES, localize(@"JIT 已开启", nil));
+        return;
+    }
+    // StikDebug attaches with debugserver, which refuses targets that are not
+    // signed for debugging. Say so plainly instead of letting it fail silently.
+    if (!getEntitlementValue(@"get-task-allow")) {
+        if (completion) completion(NO,
+            localize(@"当前安装缺少 get-task-allow 权限，StikDebug 无法附加。"
+                     @"请用开发者证书重新签名后再开启 JIT。", nil));
+        return;
+    }
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
+    if (bundleID.length == 0) {
+        if (completion) completion(NO, @"无法读取当前应用标识，请重新安装完整 IPA。");
+        return;
+    }
+
+    NSURLComponents *components = [[NSURLComponents alloc] init];
+    components.scheme = @"stikdebug";
+    components.host = @"enable-jit";
+    // Let StikDebug run the universal script it ships with. Handing it our own
+    // Base64 copy is accepted by iOS but is not reliably started, and a multi
+    // kilobyte query string is the least dependable part of the handoff.
+    components.queryItems = @[
+        [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundleID],
+        [NSURLQueryItem queryItemWithName:@"pid" value:
+            [NSString stringWithFormat:@"%d", getpid()]],
+        [NSURLQueryItem queryItemWithName:@"script-name" value:@"universal.js"],
+    ];
+    NSURL *url = components.URL;
+    if (!url) {
+        if (completion) completion(NO, @"无法构造 StikDebug 请求。");
+        return;
+    }
+
+    NSLog(@"[JITDiag] StikDebug handoff request: %@", url.absoluteString);
+    void (^finish)(BOOL, NSString *) = ^(BOOL success, NSString *message) {
+        if (completion) completion(success, message);
+    };
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // No canOpenURL probe: a container host may carry a different scheme
+        // whitelist, and the openURL completion is the authoritative answer.
+        [UIApplication.sharedApplication openURL:url options:@{}
+                               completionHandler:^(BOOL opened) {
+            NSLog(@"[JITDiag] StikDebug handoff %@", opened ? @"opened" : @"rejected");
+            if (!opened) {
+                // StikDebug is not installed or refuses the scheme. The bundled
+                // ExtensionKit helper is self-contained, so it is the only
+                // remaining route; it does need a pairing file.
+                NSLog(@"[JITDiag] falling back to the bundled ExtensionKit helper");
+                [StikDebugViewController enableJITWithBundledHelper:finish];
+                return;
+            }
+            [self waitForStikDebugAttachWithCompletion:finish];
+        }];
+    });
+}
+
+/// StikDebug takes seconds, not milliseconds: it brings up its VPN, starts
+/// debugserver and only then attaches, so poll instead of sampling once.
++ (void)waitForStikDebugAttachWithCompletion:
+        (void (^)(BOOL success, NSString *message))completion {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:90];
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!timer) {
+        if (completion) completion(NO, @"无法创建等待计时器。");
+        return;
+    }
+    __block BOOL finished = NO;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+        if (finished) return;
+        if (isJITEnabled(YES)) {
+            finished = YES;
+            dispatch_source_cancel(timer);
+            NSLog(@"[JITDiag] StikDebug attach succeeded");
+            completion(YES, localize(@"JIT 已开启", nil));
+            return;
+        }
+        if ([deadline timeIntervalSinceNow] <= 0) {
+            finished = YES;
+            dispatch_source_cancel(timer);
+            NSLog(@"[JITDiag] StikDebug attach timed out, CS_DEBUGGED=%d",
+                  PJIsDebuggerAttached() ? 1 : 0);
+            completion(NO, localize(@"等待 StikDebug 附加超时（90 秒）。"
+                                    @"请确认配对、开发者模式与 LocalDevVPN 均已就绪。", nil));
+        }
+    });
+    dispatch_resume(timer);
+}
+
++ (BOOL)enableJITWithBundledHelper:
+        (void (^)(BOOL success, NSString *message))completion {
     if (@available(iOS 26.0, *)) {
         NSData *pairingData = [NSData dataWithContentsOfFile:
             StikDebugEngine.sharedEngine.pairingFilePath];
         if (!pairingData.length) {
             if (completion) completion(NO, localize(@"请先导入本机配对文件。", nil));
-            return;
+            return NO;
         }
         NSString *framework = [NSBundle.mainBundle.privateFrameworksPath
             stringByAppendingPathComponent:@"PocketJJITCoordinator.framework/PocketJJITCoordinator"];
@@ -187,13 +309,14 @@ static void PJDumpJITEnvironment(NSString *stage) {
                         deliver(success, message ?: @"");
                     });
                 }];
-            return;
+            return YES;
         }
         if (handle) dlclose(handle);
         if (completion) completion(NO, localize(@"内置 JIT Helper 未就绪。", nil));
-        return;
+        return NO;
     }
     if (completion) completion(NO, localize(@"当前系统需要使用外部 JIT 方式。", nil));
+    return NO;
 }
 
 - (instancetype)init {
@@ -266,7 +389,8 @@ static void PJDumpJITEnvironment(NSString *stage) {
     if (section == 0) return localize(@"JIT 是否开启与系统是否支持分别检测，互不混淆。", nil);
     if (section == 1) return localize(@"完成配对文件和 LocalDevVPN 两项准备后即可开启 JIT。", nil);
     if (section == 2) return localize(@"支持 iLoader 写入 Documents/pairingFile.plist，也可导出供其他应用使用或从本机删除。", nil);
-    if (section == 3) return localize(@"开启前请先导入本机配对文件，并确保 LocalDevVPN 已启动。", nil);
+    if (section == 3) return localize(@"开启时会把请求交给本机的 StikDebug，请确认后返回本应用。"
+                                     @"无需导入配对文件；该文件仅供内置 Helper 备用。", nil);
     return nil;
 }
 
@@ -366,7 +490,7 @@ static void PJDumpJITEnvironment(NSString *stage) {
             configuration.baseBackgroundColor = UIColor.systemGreenColor;
             configuration.showsActivityIndicator = self.enabling;
             if (state == PocketJJITSetupStateReady && !self.enabling) {
-                configuration.subtitle = localize(@"就绪", nil);
+                configuration.subtitle = localize(@"就绪 · 将调用 StikDebug", nil);
             }
             if (self.enabling) configuration.image = nil;
             button.configuration = configuration;
@@ -467,7 +591,7 @@ static void PJDumpJITEnvironment(NSString *stage) {
 - (void)enableJIT {
     if (self.enabling || self.jitEnabled) return;
     self.enabling = YES;
-    self.lastStatus = localize(@"正在打开独立 JIT 执行进程…", nil);
+    self.lastStatus = localize(@"正在请求 StikDebug 开启 JIT，请在本机确认请求…", nil);
     [self.tableView reloadData];
     if (@available(iOS 26.0, *)) {
         __weak typeof(self) weakSelf = self;

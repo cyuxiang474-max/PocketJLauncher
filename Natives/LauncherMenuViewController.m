@@ -135,7 +135,7 @@
     
     if (getEntitlementValue(@"get-task-allow")) {
         [self displayProgress:localize(@"login.jit.checking", nil)];
-        if (isJITEnabled(false)) {
+        if (isJITEnabled(YES)) {
             [self displayProgress:localize(@"login.jit.enabled", nil)];
             [self displayProgress:nil];
         } else if (@available(iOS 17.0, *)) {

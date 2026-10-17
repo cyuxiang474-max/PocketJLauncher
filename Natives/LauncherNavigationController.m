@@ -32,6 +32,30 @@
 
 static void *ProgressObserverContext = &ProgressObserverContext;
 
+/// Whether the JVM may start generating code in this process.
+///
+/// StikDebug leaves the debugger attached on iOS 26+ with TXM, which is what
+/// lifts the restriction, so the strict check is the one that matches the
+/// launcher's actual runtime. CS_DEBUGGED on its own survives a detach and
+/// would let the game start against executable memory TXM has taken back.
+static BOOL PJGameLaunchJITReady(void) {
+    return isJITEnabled(YES);
+}
+
+/// Bounded wait, because an unbounded one leaves the launch alert spinning
+/// forever if the debugger never attaches.
+static void PJWaitForGameLaunchJIT(void) {
+    for (NSUInteger attempt = 0; attempt < 450; attempt++) {
+        if (PJGameLaunchJITReady()) {
+            NSLog(@"[JIT] launch gate satisfied after %lu polls",
+                  (unsigned long)(attempt + 1));
+            return;
+        }
+        usleep(200 * 1000);
+    }
+    NSLog(@"[JIT] launch gate timed out after 90s, starting anyway");
+}
+
 NSNotificationName const LauncherTaskStateDidChangeNotification =
     @"LauncherTaskStateDidChangeNotification";
 static NSString *const LauncherInterruptedDownloadKey =
@@ -794,7 +818,7 @@ static NSString *const LauncherVerifiedCompletesKey =
     // One tap owns the complete launch pipeline. Resource preparation runs
     // first; when it finishes, invokeAfterJITEnabled enables JIT if needed and
     // immediately continues into the Minecraft surface.
-    self.deferGameLaunchAfterJITEnable = !isJITEnabled(false);
+    self.deferGameLaunchAfterJITEnable = !PJGameLaunchJITReady();
 
     [self setInteractionEnabled:NO forDownloading:YES];
 
@@ -1161,56 +1185,46 @@ static NSString *const LauncherVerifiedCompletesKey =
     BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust");
     BOOL isLiveContainer = getenv("LC_HOME_PATH") != NULL;
 
-    if (isJITEnabled(false)) {
+    if (PJGameLaunchJITReady()) {
         self.deferGameLaunchAfterJITEnable = NO;
         [ALTServerManager.sharedManager stopDiscovering];
         handler();
         return;
     } else if (@available(iOS 26.0, *)) {
-        if (StikDebugEngine.sharedEngine.hasPairingFile) {
-            self.jitEnabling = YES;
-            self.activeDownloadIdentifier = self.selectedDownloadIdentifier;
-            self.launchTaskPhase = localize(@"正在开启 JIT…", nil);
-            self.progressText.text = localize(@"正在开启内置 JIT…", nil);
-            [self postTaskActive:YES];
-            [StikDebugViewController enableEmbeddedJITWithCompletion:
-                ^(BOOL success, NSString *message) {
-                    if (success || isJITEnabled(false)) {
-                        if (self.deferGameLaunchAfterJITEnable) {
-                            [self showJITReadyFeedbackThen:handler];
-                        } else {
-                            self.jitEnabling = NO;
-                            self.activeDownloadIdentifier = nil;
-                            [self postTaskActive:NO];
-                            handler();
-                        }
+        // StikDebug carries its own pairing data, so this route no longer needs
+        // a pairing file imported into PocketJ Launcher. The bundled ExtensionKit
+        // helper stays as a fallback for devices without StikDebug.
+        self.jitEnabling = YES;
+        self.activeDownloadIdentifier = self.selectedDownloadIdentifier;
+        self.launchTaskPhase = localize(@"正在开启 JIT…", nil);
+        self.progressText.text = localize(@"正在请求 StikDebug 开启 JIT…", nil);
+        [self postTaskActive:YES];
+        [StikDebugViewController enableEmbeddedJITWithCompletion:
+            ^(BOOL success, NSString *message) {
+                if (success || PJGameLaunchJITReady()) {
+                    if (self.deferGameLaunchAfterJITEnable) {
+                        [self showJITReadyFeedbackThen:handler];
                     } else {
                         self.jitEnabling = NO;
-                        self.launchTaskPhase = nil;
                         self.activeDownloadIdentifier = nil;
                         [self postTaskActive:NO];
-                        self.deferGameLaunchAfterJITEnable = NO;
-                        NSString *detail = message.length ? message : localize(@"未知错误", nil);
-                        if ([detail localizedCaseInsensitiveContainsString:@"Timed out connecting"] ||
-                            [detail localizedCaseInsensitiveContainsString:@"not ready for JIT"]) {
-                            detail = [detail stringByAppendingFormat:@"\n\n%@",
-                                localize(@"请确保 LocalDevVPN 已开启后重试。", nil)];
-                        }
-                        showDialog(localize(@"无法开启 JIT", nil), detail);
+                        handler();
                     }
-                }];
-            return;
-        }
-        ModernRootTabBarController *root =
-            [self.tabBarController isKindOfClass:ModernRootTabBarController.class]
-                ? (ModernRootTabBarController *)self.tabBarController : nil;
-        if (root) {
-            [root openJITSettingsWithConfigurationPrompt:YES];
-        } else {
-            [self pushViewController:[StikDebugViewController new] animated:YES];
-            showDialog(localize(@"JIT 等待配置", nil),
-                localize(@"开始游戏前，请先导入本机配对文件并开启 LocalDevVPN。", nil));
-        }
+                } else {
+                    self.jitEnabling = NO;
+                    self.launchTaskPhase = nil;
+                    self.activeDownloadIdentifier = nil;
+                    [self postTaskActive:NO];
+                    self.deferGameLaunchAfterJITEnable = NO;
+                    NSString *detail = message.length ? message : localize(@"未知错误", nil);
+                    if ([detail localizedCaseInsensitiveContainsString:@"Timed out connecting"] ||
+                        [detail localizedCaseInsensitiveContainsString:@"not ready for JIT"]) {
+                        detail = [detail stringByAppendingFormat:@"\n\n%@",
+                            localize(@"请确保 LocalDevVPN 已开启后重试。", nil)];
+                    }
+                    showDialog(localize(@"无法开启 JIT", nil), detail);
+                }
+            }];
         return;
     } else if (hasTrollStoreJIT) {
         NSURL *jitURL = [NSURL URLWithString:[NSString stringWithFormat:@"apple-magnifier://enable-jit?bundle-id=%@", NSBundle.mainBundle.bundleIdentifier]];
@@ -1270,10 +1284,7 @@ static NSString *const LauncherVerifiedCompletesKey =
     [self presentViewController:alert animated:YES completion:nil];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (!isJITEnabled(false)) {
-            // Perform check for every 200ms
-            usleep(1000*200);
-        }
+        PJWaitForGameLaunchJIT();
         dispatch_async(dispatch_get_main_queue(), ^{
             [alert dismissViewControllerAnimated:YES completion:^{
                 if (self.deferGameLaunchAfterJITEnable) {
