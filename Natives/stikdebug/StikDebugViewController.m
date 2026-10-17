@@ -5,6 +5,7 @@
 #import <unistd.h>
 
 #import "StikDebugEngine.h"
+#import "../LauncherPreferences.h"
 #import "../ModernUITheme.h"
 #import "../UIKit+hook.h"
 #import "../ios_uikit_bridge.h"
@@ -43,7 +44,11 @@ static void PJDumpJITEnvironment(NSString *stage) {
     NSLog(@"[JITDiag] bundlePath    = %@", bundlePath);
     NSLog(@"[JITDiag] executable    = %@", bundle.executablePath ?: @"(null)");
     NSLog(@"[JITDiag] NSHomeDirectory = %@", home);
-    NSLog(@"[JITDiag] HOME env      = %@", getenv("HOME") ?: @"(unset)");
+    const char *homeEnv = getenv("HOME");
+    NSLog(@"[JITDiag] HOME env      = %@", homeEnv ? [NSString stringWithUTF8String:homeEnv] : @"(unset)");
+    // Upstream already treats LC_HOME_PATH as the LiveContainer marker.
+    const char *lcHome = getenv("LC_HOME_PATH");
+    NSLog(@"[JITDiag] LC_HOME_PATH  = %@", lcHome ? [NSString stringWithUTF8String:lcHome] : @"(unset)");
     NSLog(@"[JITDiag] pid           = %d", getpid());
 
     // A container app such as LiveContainer relocates the guest app under
@@ -56,7 +61,7 @@ static void PJDumpJITEnvironment(NSString *stage) {
         containerTail = [home substringFromIndex:NSMaxRange(own)];
     }
     NSUInteger nestedApplications = [home componentsSeparatedByString:@"/Documents/Data/Application/"].count - 1;
-    BOOL insideContainerHost = nestedApplications > 0;
+    BOOL insideContainerHost = nestedApplications > 0 || lcHome != NULL;
     NSLog(@"[JITDiag] nested 'Documents/Data/Application' components = %lu  (containerHost=%@)",
           (unsigned long)nestedApplications, insideContainerHost ? @"YES" : @"no");
     if (insideContainerHost) {
@@ -94,12 +99,14 @@ static void PJDumpJITEnvironment(NSString *stage) {
     NSString *resources = [bundlePath stringByAppendingPathComponent:@"_CodeSignature/CodeResources"];
     if ([fm fileExistsAtPath:resources]) {
         NSData *seal = [NSData dataWithContentsOfFile:resources];
-        NSString *sealText = [[NSString alloc] initWithData:seal encoding:NSISOLatin1StringEncoding] ?: @"";
-        NSLog(@"[JITDiag] CodeResources bytes=%lu appexptRefs=%ld helperRefs=%ld coordinatorRefs=%ld",
-              (unsigned long)seal.length,
-              (long)[sealText occurrencesOfString:@"appexpt"],
-              (long)[sealText occurrencesOfString:@"PocketJJITHelper.appex"],
-              (long)[sealText occurrencesOfString:@"PocketJJITCoordinator.framework"]);
+        NSString *sealText = [[NSString alloc] initWithData:seal encoding:NSUTF8StringEncoding];
+        if (!sealText) sealText = @"";
+        NSUInteger appexptRefs = [sealText componentsSeparatedByString:@"appexpt"].count - 1;
+        NSUInteger helperRefs = [sealText componentsSeparatedByString:@"PocketJJITHelper.appex"].count - 1;
+        NSUInteger coordinatorRefs = [sealText componentsSeparatedByString:@"PocketJJITCoordinator.framework"].count - 1;
+        NSLog(@"[JITDiag] CodeResources bytes=%lu appexptRefs=%lu helperRefs=%lu coordinatorRefs=%lu",
+              (unsigned long)seal.length, (unsigned long)appexptRefs,
+              (unsigned long)helperRefs, (unsigned long)coordinatorRefs);
     } else {
         NSLog(@"[JITDiag] CodeResources MISSING (bundle is not sealed)");
     }
