@@ -22,9 +22,13 @@
 - (NSString *)userFacingErrorMessage:(NSString *)message;
 - (void)refreshLocalDevVPNStatus;
 + (void)requestStikDebugHandoffWithCompletion:
-    (void (^)(BOOL success, NSString *message))completion;
-+ (void)waitForStikDebugAttachWithCompletion:
-    (void (^)(BOOL success, NSString *message))completion;
+        (void (^)(BOOL success, NSString *message))completion;
++ (NSArray<NSURL *> *)stikDebugRequestURLs;
++ (void)tryStikDebugURLs:(NSArray<NSURL *> *)urls
+                   index:(NSUInteger)index
+                  finish:(void (^)(BOOL success, NSString *message))finish;
++ (void)waitForStikDebugAttachWithTimeout:(NSTimeInterval)timeout
+                                completion:(void (^)(BOOL attached))completion;
 + (BOOL)enableJITWithBundledHelper:
     (void (^)(BOOL success, NSString *message))completion;
 @end
@@ -176,57 +180,117 @@ static BOOL PJIsDebuggerAttached(void) {
         return;
     }
 
-    NSURLComponents *components = [[NSURLComponents alloc] init];
-    components.scheme = @"stikdebug";
-    components.host = @"enable-jit";
-    // Let StikDebug run the universal script it ships with. Handing it our own
-    // Base64 copy is accepted by iOS but is not reliably started, and a multi
-    // kilobyte query string is the least dependable part of the handoff.
-    components.queryItems = @[
-        [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundleID],
-        [NSURLQueryItem queryItemWithName:@"pid" value:
-            [NSString stringWithFormat:@"%d", getpid()]],
-        [NSURLQueryItem queryItemWithName:@"script-name" value:@"universal.js"],
-    ];
-    NSURL *url = components.URL;
-    if (!url) {
+    NSArray<NSURL *> *urls = [self stikDebugRequestURLs];
+    if (!urls.count) {
         if (completion) completion(NO, @"无法构造 StikDebug 请求。");
         return;
     }
-
-    NSLog(@"[JITDiag] StikDebug handoff request: %@", url.absoluteString);
     void (^finish)(BOOL, NSString *) = ^(BOOL success, NSString *message) {
         if (completion) completion(success, message);
     };
     dispatch_async(dispatch_get_main_queue(), ^{
-        // No canOpenURL probe: a container host may carry a different scheme
-        // whitelist, and the openURL completion is the authoritative answer.
-        [UIApplication.sharedApplication openURL:url options:@{}
-                               completionHandler:^(BOOL opened) {
-            NSLog(@"[JITDiag] StikDebug handoff %@", opened ? @"opened" : @"rejected");
-            if (!opened) {
-                // StikDebug is not installed or refuses the scheme. The bundled
-                // ExtensionKit helper is self-contained, so it is the only
-                // remaining route; it does need a pairing file.
-                NSLog(@"[JITDiag] falling back to the bundled ExtensionKit helper");
-                [StikDebugViewController enableJITWithBundledHelper:finish];
+        [self tryStikDebugURLs:urls index:0 finish:finish];
+    });
+}
+
+/// StikDebug registers both the stikdebug and the stikjit scheme, and the
+/// parameter form it honours has changed between releases: Husk's working
+/// request names StikDebug's own universal.js, while the older stikjit form
+/// also accepted a Base64 copy of our script. Rather than bet on one, try the
+/// forms in order and fall through whenever one does not produce an attach.
++ (NSArray<NSURL *> *)stikDebugRequestURLs {
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    NSString *pid = [NSString stringWithFormat:@"%d", getpid()];
+    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+
+    for (NSString *scheme in @[@"stikdebug", @"stikjit"]) {
+        NSURLComponents *components = [[NSURLComponents alloc] init];
+        components.scheme = scheme;
+        components.host = @"enable-jit";
+        components.queryItems = @[
+            [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundleID],
+            [NSURLQueryItem queryItemWithName:@"pid" value:pid],
+            [NSURLQueryItem queryItemWithName:@"script-name" value:@"universal.js"],
+        ];
+        if (components.URL) [urls addObject:components.URL];
+    }
+
+    NSData *scriptData = [NSData dataWithContentsOfFile:
+        [NSBundle.mainBundle.bundlePath
+            stringByAppendingPathComponent:@"UniversalJIT26.js"]];
+    if (scriptData.length > 0) {
+        NSURLComponents *components = [[NSURLComponents alloc] init];
+        components.scheme = @"stikjit";
+        components.host = @"enable-jit";
+        components.queryItems = @[
+            [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundleID],
+            [NSURLQueryItem queryItemWithName:@"pid" value:pid],
+            [NSURLQueryItem queryItemWithName:@"script-data" value:
+                [scriptData base64EncodedStringWithOptions:0]],
+            [NSURLQueryItem queryItemWithName:@"script-name" value:@"UniversalJIT26.js"],
+        ];
+        if (components.URL) [urls addObject:components.URL];
+        NSLog(@"[JITDiag] added the bundled UniversalJIT26.js request form");
+    } else {
+        NSLog(@"[JITDiag] UniversalJIT26.js is not in the bundle");
+    }
+    return urls;
+}
+
++ (void)tryStikDebugURLs:(NSArray<NSURL *> *)urls
+                   index:(NSUInteger)index
+                  finish:(void (^)(BOOL success, NSString *message))finish {
+    if (index >= urls.count) {
+        // StikDebug is not installed or honoured none of the forms. The bundled
+        // ExtensionKit helper is self-contained, so it is the last route; it
+        // does need a pairing file.
+        NSLog(@"[JITDiag] every StikDebug request form failed, using the bundled helper");
+        [StikDebugViewController enableJITWithBundledHelper:finish];
+        return;
+    }
+    NSURL *url = urls[index];
+    NSLog(@"[JITDiag] StikDebug request %lu/%lu scheme=%@",
+          (unsigned long)(index + 1), (unsigned long)urls.count, url.scheme);
+    // No canOpenURL probe: a container host may carry a different scheme
+    // whitelist, and openURL's completion is the authoritative answer.
+    [UIApplication.sharedApplication openURL:url options:@{}
+                           completionHandler:^(BOOL opened) {
+        if (!opened) {
+            NSLog(@"[JITDiag] %@:// was refused, trying the next form", url.scheme);
+            [StikDebugViewController tryStikDebugURLs:urls
+                                                 index:index + 1
+                                                finish:finish];
+            return;
+        }
+        NSLog(@"[JITDiag] %@:// was accepted, waiting for the debugger", url.scheme);
+        // The first form gets the generous window because it is the one that
+        // works on current releases; later ones only confirm a mismatch.
+        NSTimeInterval window = index == 0 ? 90 : 30;
+        [StikDebugViewController waitForStikDebugAttachWithTimeout:window
+                                                        completion:^(BOOL attached) {
+            if (attached) {
+                finish(YES, localize(@"JIT 已开启", nil));
                 return;
             }
-            [self waitForStikDebugAttachWithCompletion:finish];
+            NSLog(@"[JITDiag] %@:// produced no attach, trying the next form",
+                  url.scheme);
+            [StikDebugViewController tryStikDebugURLs:urls
+                                                 index:index + 1
+                                                finish:finish];
         }];
-    });
+    }];
 }
 
 /// StikDebug takes seconds, not milliseconds: it brings up its VPN, starts
 /// debugserver and only then attaches, so poll instead of sampling once.
-+ (void)waitForStikDebugAttachWithCompletion:
-        (void (^)(BOOL success, NSString *message))completion {
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:90];
++ (void)waitForStikDebugAttachWithTimeout:(NSTimeInterval)timeout
+                                completion:(void (^)(BOOL attached))completion {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     dispatch_source_t timer = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     if (!timer) {
-        if (completion) completion(NO, @"无法创建等待计时器。");
+        completion(NO);
         return;
     }
     __block BOOL finished = NO;
@@ -238,16 +302,17 @@ static BOOL PJIsDebuggerAttached(void) {
             finished = YES;
             dispatch_source_cancel(timer);
             NSLog(@"[JITDiag] StikDebug attach succeeded");
-            completion(YES, localize(@"JIT 已开启", nil));
+            completion(YES);
             return;
         }
         if ([deadline timeIntervalSinceNow] <= 0) {
             finished = YES;
             dispatch_source_cancel(timer);
-            NSLog(@"[JITDiag] StikDebug attach timed out, CS_DEBUGGED=%d",
-                  PJIsDebuggerAttached() ? 1 : 0);
-            completion(NO, localize(@"等待 StikDebug 附加超时（90 秒）。"
-                                    @"请确认配对、开发者模式与 LocalDevVPN 均已就绪。", nil));
+            NSLog(@"[JITDiag] StikDebug attach timed out after %.0fs, "
+                  @"CS_DEBUGGED=%d get-task-allow=%d",
+                  timeout, PJIsDebuggerAttached() ? 1 : 0,
+                  getEntitlementValue(@"get-task-allow") ? 1 : 0);
+            completion(NO);
         }
     });
     dispatch_resume(timer);
